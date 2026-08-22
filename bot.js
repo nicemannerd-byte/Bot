@@ -1,687 +1,611 @@
-const mineflayer = require('mineflayer')
-const mcDataLoader = require('minecraft-data')
-const { pathfinder, Movements, goals } = require('mineflayer-pathfinder')
-const collectBlock = require('mineflayer-collectblock').plugin
-const toolPlugin = require('mineflayer-tool').plugin
-const pvpPlugin = require('mineflayer-pvp').plugin
-const autoEat = require('mineflayer-auto-eat').loader
-const readline = require('readline')
+require("dotenv").config();
+
+const mineflayer = require("mineflayer");
+const { pathfinder, Movements, goals } = require("mineflayer-pathfinder");
+const pvp = require("mineflayer-pvp").plugin;
+const minecraftData = require("minecraft-data");
 
 const CFG = {
-  host: process.env.MC_HOST || 'stridesmp.mcsh.io',
+  host: process.env.MC_HOST || "stridesmp.mcsh.io",
   port: Number(process.env.MC_PORT || 25565),
-  username: process.env.MC_USERNAME || 'FayaazMJacc',
-  version: '1.21.11',
-  auth: 'offline',
+  username: process.env.MC_USERNAME || "FayaazMJacc",
+  version: process.env.MC_VERSION || undefined,
 
-  // Set these targets in ModVC if you want a shorter test run.
-  targetDiamonds: Number(process.env.TARGET_DIAMONDS || 192),
-  targetGold: Number(process.env.TARGET_GOLD || 192),
-  targetApples: Number(process.env.TARGET_APPLES || 32),
+  hostileRange: 12,
+  dangerRange: 4,
+  lowHealth: 8,
+  lowFood: 8,
+  reconnectMs: 4000,
+  loopMs: 350
+};
 
-  // Safety/behavior limits.
-  maxSearchDistance: 80,
-  dangerousRadius: 10,
-  taskTimeoutMs: 90000,
+let bot = null;
+let data = null;
+let moves = null;
+let stopped = false;
+let phase = "WOOD";
+let recovering = false;
+let currentTask = "Starting";
+let deathPosition = null;
+let deathTime = 0;
 
-  // Combat behavior.
-  engageRadius: 10,
-  lowHealthThreshold: 8,
+const HOSTILES = new Set([
+  "zombie","skeleton","creeper","spider","cave_spider","drowned",
+  "husk","stray","witch","pillager","vindicator","evoker",
+  "ravager","phantom","silverfish","enderman","blaze","magma_cube","slime"
+]);
 
-  // Death/item-recovery behavior.
-  recoveryTimeoutMs: 5 * 60 * 1000, // vanilla dropped-item despawn time
-  recoveryMaxDistance: 200
+const LOGS = [
+  "oak_log","spruce_log","birch_log","jungle_log",
+  "acacia_log","dark_oak_log","mangrove_log","cherry_log"
+];
+
+const PICKAXES = [
+  "netherite_pickaxe","diamond_pickaxe","iron_pickaxe",
+  "stone_pickaxe","wooden_pickaxe"
+];
+
+const WEAPONS = [
+  "netherite_sword","diamond_sword","iron_sword","stone_sword",
+  "wooden_sword","golden_sword",
+  "netherite_axe","diamond_axe","iron_axe","stone_axe","wooden_axe"
+];
+
+const FOODS = [
+  "cooked_beef","cooked_porkchop","cooked_mutton","cooked_chicken",
+  "bread","baked_potato","cooked_rabbit","apple","carrot",
+  "potato","sweet_berries"
+];
+
+function log(...x) {
+  console.log("[BOT]", ...x);
 }
 
-const bot = mineflayer.createBot(CFG)
-
-// --- Smooth head turning -----------------------------------------------
-// Pathfinder/pvp/collectblock all call bot.look() every tick with a fresh
-// target angle, which is what causes the visible instant "snap." Wrapping
-// the primitive here clamps how far the head can rotate per call; since
-// it's still invoked ~20x/sec by those plugins, the head eases toward the
-// target over a few ticks instead of teleporting to it. This is a purely
-// client-side smoothing change - it doesn't alter what the bot can do or
-// see, so it stays "legit."
-const _rawLook = bot.look.bind(bot)
-const MAX_TURN_PER_CALL = (28 * Math.PI) / 180 // ~28 degrees per call
-function normalizeAngle(a) {
-  a = a % (Math.PI * 2)
-  if (a > Math.PI) a -= Math.PI * 2
-  if (a < -Math.PI) a += Math.PI * 2
-  return a
-}
-function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)) }
-bot.look = function (yaw, pitch, force) {
-  if (!bot.entity) return _rawLook(yaw, pitch, force)
-  const curYaw = bot.entity.yaw
-  const curPitch = bot.entity.pitch
-  const dYaw = normalizeAngle(yaw - curYaw)
-  const dPitch = pitch - curPitch
-  const newYaw = curYaw + clamp(dYaw, -MAX_TURN_PER_CALL, MAX_TURN_PER_CALL)
-  const newPitch = curPitch + clamp(dPitch, -MAX_TURN_PER_CALL, MAX_TURN_PER_CALL)
-  return _rawLook(newYaw, newPitch, force)
+function setTask(task) {
+  currentTask = task;
+  log("Task:", task);
 }
 
-bot.loadPlugin(pathfinder)
-bot.loadPlugin(collectBlock)
-bot.loadPlugin(toolPlugin)
-bot.loadPlugin(pvpPlugin)
-bot.loadPlugin(autoEat)
-
-let mcData
-let movements
-let stopped = false
-let busy = false
-let phase = 'boot'
-let lastAction = ''
-let home = null
-let lastKnownPos = null   // updated every tick, used to locate death position
-let pendingRecovery = null // { deathPos, inLava, ts } set on death, consumed on next RUN
-let hazardBusy = false
-
-const hostile = new Set([
-  'zombie','husk','drowned','skeleton','stray','creeper','spider',
-  'cave_spider','witch','enderman','silverfish','blaze','magma_cube',
-  'phantom','pillager','vindicator','evoker','vex','ravager',
-  'warden','piglin_brute','zoglin'
-])
-
-// Mobs the bot will not melee even when healthy - explosion, fire, or
-// raw damage output makes fighting them a bad trade for a resource bot.
-const avoidMobs = new Set([
-  'creeper','blaze','magma_cube','warden','ravager',
-  'wither','ender_dragon','piglin_brute','zoglin'
-])
-
-const foodNames = [
-  'cooked_beef','cooked_porkchop','cooked_chicken','cooked_mutton',
-  'cooked_rabbit','bread','baked_potato','carrot','apple'
-]
-
-const logNames = [
-  'oak_log','birch_log','spruce_log','jungle_log',
-  'acacia_log','dark_oak_log','mangrove_log','cherry_log'
-]
-
-const stoneNames = ['stone','cobblestone','deepslate']
-const coalNames = ['coal_ore','deepslate_coal_ore']
-const ironNames = ['iron_ore','deepslate_iron_ore']
-const diamondNames = ['diamond_ore','deepslate_diamond_ore']
-const goldNames = ['gold_ore','deepslate_gold_ore','nether_gold_ore']
-const flintNames = ['gravel']
-const obsidianNames = ['obsidian']
-
-function say(msg) {
-  console.log(`[BOT] ${msg}`)
+function inventorySummary() {
+  const items = bot.inventory.items();
+  if (!items.length) return "empty";
+  return items.map(i => `${i.name} x${i.count}`).join(", ");
 }
-function chat(msg) {
-  if (!bot.player) return
-  bot.chat(msg)
+
+function playerNameForChat(username) {
+  return username || "Unknown";
 }
-function pos() {
-  if (!bot.entity) return null
-  const p = bot.entity.position
-  return `${p.x.toFixed(1)} ${p.y.toFixed(1)} ${p.z.toFixed(1)}`
+
+function sendChat(message) {
+  // Normal Mineflayer chat API: the server supplies the real sender name.
+  bot.chat(message);
 }
-function invCount(names) {
-  const set = new Set(names)
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function distance(a, b) {
+  return a.distanceTo(b);
+}
+
+function inventoryCount(names) {
+  if (!Array.isArray(names)) names = [names];
   return bot.inventory.items()
-    .filter(i => set.has(i.name))
-    .reduce((n, i) => n + i.count, 0)
-}
-function itemCount(name) {
-  return invCount([name])
-}
-function printStatus() {
-  say(`phase=${phase} pos=${pos() || 'unknown'} last=${lastAction}`)
-  say(`wood=${invCount(logNames)} stone=${invCount(stoneNames)} coal=${invCount(coalNames)} iron=${invCount(ironNames)} diamonds=${itemCount('diamond')} gold=${invCount(['gold_ingot','raw_gold','gold_nugget'])} apples=${itemCount('apple')}`)
-}
-function setPhase(p) {
-  phase = p
-  say(`PHASE -> ${p}`)
-  say(`CORDS -> ${pos() || 'unknown'}`)
-}
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)) }
-
-function nearestHostile() {
-  if (!bot.entity) return null
-  let best = null, bestD = Infinity
-  for (const e of Object.values(bot.entities)) {
-    if (!e || !e.position || !e.name) continue
-    if (!hostile.has(e.name)) continue
-    const d = bot.entity.position.distanceTo(e.position)
-    if (d < bestD) { best = e; bestD = d }
-  }
-  return best ? { entity: best, distance: bestD } : null
+    .filter(i => names.includes(i.name))
+    .reduce((sum, i) => sum + i.count, 0);
 }
 
-async function flee(entity) {
-  say(`Avoiding dangerous mob ${entity.name}.`)
-  bot.pvp.stop()
-  bot.pathfinder.setGoal(null)
-  // Note: vanilla doesn't allow sprinting while moving backward, so this
-  // retreat is walking speed by design - sprinting away would require
-  // turning around first, which is worse when something is already close.
-  bot.setControlState('back', true)
-  await sleep(700)
-  bot.setControlState('back', false)
+function has(names) {
+  return inventoryCount(names) > 0;
 }
 
-// Fight-or-flee decision: fightable mobs get engaged with pvp when the bot
-// is healthy enough; dangerous mobs (creeper/blaze/etc.) or low bot health
-// always trigger disengagement instead.
-async function handleHostiles() {
-  if (stopped || !bot.entity) return
-  const h = nearestHostile()
-  if (!h) return
-  const { entity, distance } = h
-
-  if (typeof bot.health === 'number' && bot.health <= CFG.lowHealthThreshold) {
-    if (distance <= CFG.dangerousRadius) await flee(entity)
-    return
-  }
-  if (avoidMobs.has(entity.name)) {
-    if (distance <= CFG.dangerousRadius) await flee(entity)
-    return
-  }
-  if (distance <= CFG.engageRadius) {
-    if (bot.pvp.target !== entity) {
-      await equipBest(['diamond_sword','iron_sword','stone_sword','golden_sword','wooden_sword'])
-      lastAction = `fighting ${entity.name}`
-      say(`Engaging ${entity.name} at ${distance.toFixed(1)} blocks.`)
-      bot.pvp.attack(entity)
-    }
-  }
+function bestItem(names) {
+  return bot.inventory.items().find(i => names.includes(i.name));
 }
 
-function isLavaNear(position, radius = 1) {
-  if (!position) return false
-  for (let dx = -radius; dx <= radius; dx++) {
-    for (let dy = -radius; dy <= radius; dy++) {
-      for (let dz = -radius; dz <= radius; dz++) {
-        const b = bot.blockAt(position.offset(dx, dy, dz))
-        if (b && b.name === 'lava') return true
+function nearestEntity(filter) {
+  return Object.values(bot.entities)
+    .filter(e => e && e.position && filter(e))
+    .sort((a, b) =>
+      distance(bot.entity.position, a.position) -
+      distance(bot.entity.position, b.position)
+    )[0];
+}
+
+function isHostile(e) {
+  return e.type === "mob" && HOSTILES.has((e.name || "").toLowerCase());
+}
+
+function dangerousBlock(block) {
+  if (!block) return false;
+  return ["lava","flowing_lava","fire","soul_fire"].includes(block.name);
+}
+
+function dangerAt(pos) {
+  const center = pos.floored();
+  for (let x = -CFG.dangerRange; x <= CFG.dangerRange; x++) {
+    for (let y = -2; y <= 2; y++) {
+      for (let z = -CFG.dangerRange; z <= CFG.dangerRange; z++) {
+        if (dangerousBlock(bot.blockAt(center.offset(x,y,z)))) return true;
       }
     }
   }
-  return false
+  return false;
 }
 
-// Proactive hazard check, run on an interval regardless of current phase.
-// Best-effort only: a block broken open mid-dig can expose lava faster
-// than this loop can react, so this reduces risk, it does not eliminate it.
-async function hazardCheckLoop() {
-  if (stopped || hazardBusy || !bot.entity) return
-  const p = bot.entity.position
-  if (isLavaNear(p.floored(), 0) || isLavaNear(p.floored().offset(0, -1, 0), 0)) {
-    hazardBusy = true
-    say('Lava detected underfoot/adjacent - evading.')
-    bot.pathfinder.setGoal(null)
-    bot.setControlState('jump', true)
-    bot.setControlState('back', true)
-    await sleep(500)
-    bot.setControlState('jump', false)
-    bot.setControlState('back', false)
-    hazardBusy = false
-  }
+/*
+ * No camera/head snapping:
+ * There are intentionally no bot.look(), bot.lookAt(), forced yaw,
+ * forced pitch, or instant rotation calls in this project.
+ */
+function enableFastMovement() {
+  moves.canDig = true;
+  moves.allowParkour = true;
+  moves.allowSprinting = true;
+  moves.allow1by1towers = false;
+  moves.maxDropDown = 3;
+  moves.infiniteLiquidDropdownDistance = false;
+  bot.pathfinder.setMovements(moves);
+  bot.setControlState("sprint", true);
 }
 
-// Tries to recover dropped items near a death location, bounded by both a
-// time budget (matches vanilla's 5-minute item despawn) and a distance cap.
-// Whatever ends up in the inventory afterward is what runOnePhase() resumes
-// from - if recovery fails entirely, that's an empty/near-empty inventory,
-// which is functionally "start from 0" since every acquire* function checks
-// current counts first.
-async function attemptRecovery(deathPos, timeBudgetMs) {
-  const start = Date.now()
-  say(`Attempting item recovery near ${deathPos.x.toFixed(1)} ${deathPos.y.toFixed(1)} ${deathPos.z.toFixed(1)} (up to ${Math.round(timeBudgetMs / 1000)}s left).`)
-
-  if (!bot.entity || bot.entity.position.distanceTo(deathPos) > CFG.recoveryMaxDistance) {
-    say(`Death location is more than ${CFG.recoveryMaxDistance} blocks away. Abandoning recovery.`)
-    return false
+async function safeGoto(goal, timeout = 10000) {
+  if (dangerAt(bot.entity.position)) {
+    await escapeDanger();
+    if (dangerAt(bot.entity.position)) return false;
   }
 
   try {
-    await bot.pathfinder.goto(new goals.GoalNear(deathPos.x, deathPos.y, deathPos.z, 3))
-  } catch (e) {
-    say(`Could not path back to death location: ${e.message}`)
-    return false
-  }
-
-  let recoveredAny = false
-  while (Date.now() - start < timeBudgetMs && !stopped) {
-    const drops = Object.values(bot.entities).filter(e =>
-      e && e.position && e.name === 'item' && e.position.distanceTo(deathPos) < 16
-    )
-    if (!drops.length) {
-      await sleep(2000)
-      continue
-    }
-    for (const drop of drops) {
-      if (Date.now() - start >= timeBudgetMs || stopped) break
-      try {
-        await bot.pathfinder.goto(new goals.GoalNear(drop.position.x, drop.position.y, drop.position.z, 1))
-        recoveredAny = true
-      } catch {}
-    }
-    if (recoveredAny) break
-    await sleep(1500)
-  }
-
-  if (!recoveredAny) say('No dropped items recovered within the time/distance window.')
-  return recoveredAny
-}
-
-function hasItem(name) { return bot.inventory.items().some(i => i.name === name) }
-
-async function equipBest(types) {
-  for (const type of types) {
-    const item = bot.inventory.items().find(i => i.name === type)
-    if (item) {
-      try {
-        await bot.equip(item, 'hand')
-        return true
-      } catch {}
-    }
-  }
-  return false
-}
-
-async function collectNearest(names, count, maxDistance = CFG.maxSearchDistance) {
-  if (stopped) return false
-  const targets = new Set(names)
-  const blocks = bot.findBlocks({
-    matching: b => b && targets.has(b.name),
-    maxDistance,
-    count: count * 3 // over-fetch, then pick the truly nearest ones ourselves
-  })
-  if (!blocks.length) return false
-
-  // Route optimization: sort candidates by actual distance so the bot visits
-  // the closest cluster first instead of whatever order findBlocks returned.
-  const origin = bot.entity.position
-  blocks.sort((a, b) => origin.distanceTo(a) - origin.distanceTo(b))
-  const ordered = blocks.slice(0, count)
-
-  lastAction = `collect ${names.join(',')}`
-  say(`Collecting ${ordered.length} target block(s), nearest-first.`)
-  try {
-    await bot.collectBlock.collect(ordered, {
-      ignoreNoPath: true
-    })
-    return true
-  } catch (e) {
-    say(`Collection stopped: ${e.message}`)
-    bot.pathfinder.setGoal(null)
-    return false
-  }
-}
-
-async function craftByName(name, count = 1) {
-  const item = mcData.itemsByName[name]
-  if (!item) return false
-  const recipes = bot.recipesFor(item.id, null, count, null)
-  if (!recipes.length) return false
-  try {
-    await bot.craft(recipes[0], count, null)
-    say(`Crafted ${count} x ${name}`)
-    return true
-  } catch (e) {
-    say(`Craft ${name} failed: ${e.message}`)
-    return false
-  }
-}
-
-async function craftToolSet(material) {
-  await craftByName(`${material}_pickaxe`, 1)
-  await craftByName(`${material}_axe`, 1)
-  await craftByName(`${material}_sword`, 1)
-  await craftByName(`${material}_shovel`, 1)
-}
-
-async function smeltAll(inputName, outputName, wanted) {
-  // Finds a nearby furnace and uses it when available. The bot does not
-  // create an unattended furnace chain; this keeps the behavior bounded.
-  const furnace = bot.findBlock({
-    matching: b => b && b.name === 'furnace',
-    maxDistance: 24
-  })
-  if (!furnace) {
-    say(`No nearby furnace for smelting ${inputName}.`)
-    return false
-  }
-
-  const input = bot.inventory.items().find(i => i.name === inputName)
-  if (!input) return false
-
-  const fuel = bot.inventory.items().find(i =>
-    ['coal','charcoal','oak_log','birch_log','spruce_log','jungle_log',
-     'acacia_log','dark_oak_log','mangrove_log','cherry_log'].includes(i.name)
-  )
-  if (!fuel) return false
-
-  try {
-    const Furnace = require('mineflayer/lib/plugins/furnace')
-    await bot.openFurnace(furnace)
+    await Promise.race([
+      bot.pathfinder.goto(goal),
+      sleep(timeout).then(() => { throw new Error("path timeout"); })
+    ]);
+    return !dangerAt(bot.entity.position);
   } catch {
-    // Furnace API varies between releases. Leave the phase safe instead of looping.
-    say(`Furnace API unavailable in this Mineflayer build.`)
-    return false
+    bot.pathfinder.setGoal(null);
+    return false;
   }
-  return false
 }
 
-async function acquireWood() {
-  setPhase('wood')
-  if (invCount(logNames) >= 16) return true
-  return await collectNearest(logNames, 16)
-}
+async function escapeDanger() {
+  bot.pathfinder.setGoal(null);
+  bot.pvp.stop();
 
-async function acquireStone() {
-  setPhase('stone')
-  if (invCount(stoneNames) >= 32) return true
-  return await collectNearest(stoneNames, 32)
-}
+  const p = bot.entity.position.floored();
+  const options = [
+    p.offset(6,0,0), p.offset(-6,0,0),
+    p.offset(0,0,6), p.offset(0,0,-6),
+    p.offset(5,2,5), p.offset(-5,2,-5)
+  ];
 
-async function acquireCoal() {
-  setPhase('coal')
-  if (invCount(coalNames) >= 8) return true
-  return await collectNearest(coalNames, 8)
-}
+  for (const t of options) {
+    if (dangerousBlock(bot.blockAt(t)) ||
+        dangerousBlock(bot.blockAt(t.offset(0,-1,0)))) continue;
 
-async function acquireIron() {
-  setPhase('iron')
-  if (itemCount('iron_ingot') >= 24) return true
-  // Raw ore is collected first. Smelting requires a furnace; the bot will
-  // craft one when possible.
-  if (invCount(ironNames) < 24) {
-    const got = await collectNearest(ironNames, 16)
-    if (!got) return false
+    if (await safeGoto(new goals.GoalNear(t.x,t.y,t.z,2), 5000)) return true;
   }
-  if (!hasItem('furnace')) await craftByName('furnace', 1)
-  say(`Iron ore collected. Smelting/upgrade is the next bounded task.`)
-  return true
+  return false;
 }
 
-async function surfaceAndBed() {
-  setPhase('surface/bed')
-  // If underground, head upward only a bounded amount. If pathfinder fails,
-  // stop rather than repeatedly digging.
-  if (bot.entity.position.y < 55) {
-    const p = bot.entity.position
-    try {
-      await bot.pathfinder.goto(new goals.GoalY(55))
-    } catch {
-      say('Could not safely return to the surface.')
-      return false
-    }
-  }
-  if (!hasItem('white_wool') && !hasItem('bed')) {
-    await collectNearest(['white_wool','black_wool','gray_wool','light_gray_wool',
-      'brown_wool','red_wool','orange_wool','yellow_wool','lime_wool',
-      'green_wool','cyan_wool','light_blue_wool','blue_wool','purple_wool',
-      'magenta_wool','pink_wool'], 3, 48)
-  }
-  if (!hasItem('bed')) await craftByName('white_bed', 1)
-  return hasItem('white_bed') || hasItem('bed')
+function nearestBlock(names, maxDistance = 48) {
+  const set = new Set(Array.isArray(names) ? names : [names]);
+  return bot.findBlock({
+    maxDistance,
+    matching: b => b && set.has(b.name)
+  });
 }
 
-async function diamondRun() {
-  setPhase('diamonds')
-  const have = itemCount('diamond')
-  if (have >= CFG.targetDiamonds) return true
+async function mineBlock(block) {
+  if (!block || !block.position) return false;
+  if (dangerAt(block.position)) return false;
 
-  // Use exposed nearby diamond ore first.
-  if (await collectNearest(diamondNames, 8, 96)) return true
-
-  // Conservative branch-mining fallback. This intentionally stops at a
-  // bounded number of tunnels rather than running indefinitely.
-  say('No exposed diamonds nearby; starting a bounded search.')
-  const p = bot.entity.position.floored()
-  const y = Math.min(16, Math.max(-50, p.y))
   try {
-    await bot.pathfinder.goto(new goals.GoalY(y))
-  } catch {}
-  for (let i = 0; i < 4 && !stopped; i++) {
-    const dir = i % 2 === 0 ? 1 : -1
-    const dirKey = dir > 0 ? 'forward' : 'back'
-    // Vanilla only allows sprinting while moving forward; sprint on the
-    // backward leg is a no-op, so only set it going out, not coming back.
-    if (dir > 0) bot.setControlState('sprint', true)
-    bot.setControlState(dirKey, true)
-
-    const segmentStart = Date.now()
-    const segmentMs = 24 * 250 // same total travel budget per tunnel leg as before
-    while (Date.now() - segmentStart < segmentMs && !stopped) {
-      await handleHostiles()
-      if (await collectNearest(diamondNames, 4, 8)) {
-        // collectNearest hands control to pathfinder to reach/mine the
-        // block; resume the tunnel heading afterward instead of stopping.
-        bot.setControlState(dirKey, true)
-        if (dir > 0) bot.setControlState('sprint', true)
-      }
-      if (itemCount('diamond') >= CFG.targetDiamonds) {
-        bot.setControlState(dirKey, false)
-        bot.setControlState('sprint', false)
-        return true
-      }
-      await sleep(300)
-    }
-    bot.setControlState(dirKey, false)
-    bot.setControlState('sprint', false)
+    await safeGoto(
+      new goals.GoalNear(block.position.x, block.position.y, block.position.z, 2),
+      7000
+    );
+    if (dangerAt(block.position)) return false;
+    if (!bot.canDigBlock(block)) return false;
+    await bot.dig(block, true);
+    return true;
+  } catch {
+    return false;
   }
-  return itemCount('diamond') >= CFG.targetDiamonds
 }
 
-async function goldRun() {
-  setPhase('gold')
-  if (invCount(['gold_ingot','raw_gold']) >= CFG.targetGold) return true
-  if (await collectNearest(goldNames, 12, 96)) return false
-  say('No nearby gold. Stopping this bounded gold search until instructed again.')
-  return false
+async function collectBlocks(names, amount) {
+  let attempts = 0;
+  while (inventoryCount(names) < amount && attempts++ < 12) {
+    const block = nearestBlock(names);
+    if (!block) return false;
+    if (!(await mineBlock(block))) return false;
+    await sleep(80);
+  }
+  return inventoryCount(names) >= amount;
 }
 
-async function obsidianAndFlint() {
-  setPhase('obsidian/flint')
-  if (invCount(obsidianNames) < 10) {
-    await collectNearest(obsidianNames, 10, 64)
-  }
-  if (itemCount('flint') < 1) {
-    await collectNearest(flintNames, 8, 64)
-  }
-  if (hasItem('iron_ingot') && itemCount('flint') > 0) {
-    await craftByName('flint_and_steel', 1)
-  }
-  return true
-}
+async function craft(name, count = 1) {
+  if (!data.itemsByName[name]) return false;
 
-async function appleRun() {
-  setPhase('apples')
-  if (itemCount('apple') >= CFG.targetApples) return true
-  await collectNearest(['oak_leaves','dark_oak_leaves'], 64, 64)
-  return itemCount('apple') >= CFG.targetApples
-}
-
-async function runOnePhase() {
-  if (stopped || busy) return
-  busy = true
   try {
-    // Finite state machine: each phase is attempted once per command/run.
-    await acquireWood()
-    await acquireStone()
-    await craftToolSet('stone')
-    await acquireCoal()
-    await surfaceAndBed()
-    await acquireIron()
-    await craftToolSet('iron')
-    await diamondRun()
-    await obsidianAndFlint()
-    await goldRun()
-    await appleRun()
-    setPhase('complete')
-    say('Progression run finished or reached a bounded stopping point.')
-    say('Waiting for further instructions. No automatic loop.')
-  } catch (e) {
-    say(`RUN STOPPED: ${e.stack || e.message}`)
-  } finally {
-    busy = false
+    const recipes = bot.recipesFor(data.itemsByName[name].id, null, 1, null);
+    if (!recipes.length) return false;
+    await bot.craft(recipes[0], count, null);
+    return true;
+  } catch {
+    return false;
   }
 }
 
-function stopBot(reason = 'manual') {
-  stopped = true
-  bot.pvp.stop()
-  bot.pathfinder.setGoal(null)
-  for (const c of ['forward','back','left','right','jump','sprint','sneak','attack']) {
-    try { bot.setControlState(c, false) } catch {}
+async function equipBest(names) {
+  const item = bestItem(names);
+  if (!item) return false;
+  try {
+    await bot.equip(item, "hand");
+    return true;
+  } catch {
+    return false;
   }
-  say(`STOPPED (${reason}) at ${pos() || 'unknown'}`)
 }
 
-bot.once('spawn', () => {
-  mcData = mcDataLoader(bot.version)
-  movements = new Movements(bot)
-  movements.allowParkour = true      // jump gaps/1-block steps instead of walking around - faster routes
-  movements.allow1by1towers = false
-  movements.canDig = true
-  movements.maxDropDown = 3
-  movements.allowSprinting = true    // speedrunner-style movement instead of walking
-  bot.pathfinder.setMovements(movements)
+async function eat() {
+  if (bot.food >= CFG.lowFood) return true;
 
-  home = bot.entity.position.clone()
-  lastKnownPos = bot.entity.position.clone()
-  say(`Connected as ${CFG.username} to ${CFG.host}:${CFG.port}`)
-  say(`CORDS -> ${pos()}`)
-  say('Type RUN, STOP, PAUSE, STATUS, CORDS, TASK, INV, or CHAT <message> in the ModVC terminal.')
-  say('Minecraft chat is mirrored below.')
+  const food = bot.inventory.items()
+    .filter(i => FOODS.includes(i.name))
+    .sort((a,b) => b.count - a.count)[0];
 
-  bot.on('physicsTick', () => {
-    if (bot.entity) lastKnownPos = bot.entity.position.clone()
-  })
-  setInterval(() => { handleHostiles().catch(() => {}) }, 1200)
-  setInterval(() => { hazardCheckLoop().catch(() => {}) }, 400)
-})
+  if (!food) return false;
 
-// The 'message' event fires for chat AND system/game_info text. Player chat
-// is already logged cleanly (with username) by the 'chat' event below, so
-// skip it here to avoid a second, unattributed copy of the same line.
-bot.on('message', (jsonMsg, position) => {
-  if (position === 'chat') return
-  console.log(`[MC] ${jsonMsg.toString()}`)
-})
-
-bot.on('chat', (username, message) => {
-  if (username === bot.username) return
-  console.log(`[CHAT] <${username}> ${message}`)
-})
-
-bot.on('whisper', (username, message) => {
-  if (username === bot.username) return
-  console.log(`[WHISPER] <${username}> ${message}`)
-})
-
-bot.on('entityHurt', async entity => {
-  if (entity === bot.entity) await handleHostiles()
-})
-
-bot.on('death', () => {
-  const deathPos = lastKnownPos || (bot.entity && bot.entity.position) || null
-  const inLava = deathPos ? isLavaNear(deathPos.floored(), 1) : false
-
-  if (deathPos && !inLava) {
-    pendingRecovery = { deathPos, inLava: false, ts: Date.now() }
-    say(`BOT DIED at ${deathPos.x.toFixed(1)} ${deathPos.y.toFixed(1)} ${deathPos.z.toFixed(1)}. Items may be recoverable - will attempt recovery on next RUN (5 min / ${CFG.recoveryMaxDistance} block window).`)
-  } else if (deathPos && inLava) {
-    say(`BOT DIED in lava at ${deathPos.x.toFixed(1)} ${deathPos.y.toFixed(1)} ${deathPos.z.toFixed(1)}. Items presumed lost - next RUN starts fresh.`)
-  } else {
-    say('BOT DIED (position unknown). Next RUN starts fresh.')
+  try {
+    await bot.equip(food, "hand");
+    await bot.consume();
+    return true;
+  } catch {
+    return false;
   }
+}
 
-  stopBot('death')
-  // Send the respawn packet so the bot regains control; it still waits for
-  // an explicit RUN before doing anything (no autonomous respawn loop).
-  try { bot.respawn() } catch {}
-})
-
-bot.on('kicked', reason => say(`KICKED: ${JSON.stringify(reason)}`))
-bot.on('error', err => say(`ERROR: ${err.message}`))
-bot.on('end', () => say('Disconnected.'))
-
-const rl = readline.createInterface({ input: process.stdin, output: process.stdout })
-rl.on('line', async line => {
-  const input = line.trim()
-  const upper = input.toUpperCase()
-
-  if (upper === 'RUN') {
-    if (stopped) {
-      stopped = false
-      say('Resuming only because you explicitly requested RUN.')
+async function getWoodAndStarterTools() {
+  if (!has(PICKAXES)) {
+    if (!has(LOGS)) {
+      const logBlock = nearestBlock(LOGS, 48);
+      if (!logBlock || !(await mineBlock(logBlock))) return false;
     }
-    if (pendingRecovery) {
-      const rec = pendingRecovery
-      pendingRecovery = null
-      if (rec.inLava) {
-        say('Last death was in lava; items presumed lost. Starting fresh.')
-      } else if (Date.now() - rec.ts > CFG.recoveryTimeoutMs) {
-        say('More than 5 minutes have passed since death; dropped items have likely despawned. Starting fresh.')
-      } else {
-        const remaining = CFG.recoveryTimeoutMs - (Date.now() - rec.ts)
-        const recovered = await attemptRecovery(rec.deathPos, remaining)
-        say(recovered
-          ? 'Recovered items from the death location - continuing from current inventory.'
-          : 'Recovery unsuccessful - continuing from current inventory (effectively starting fresh).')
+
+    await craft("oak_planks", 4);
+    await craft("stick", 4);
+    await craft("crafting_table", 1);
+    await craft("wooden_pickaxe", 1);
+  }
+
+  return has(PICKAXES);
+}
+
+async function getStoneTools() {
+  if (has(["stone_pickaxe","iron_pickaxe","diamond_pickaxe","netherite_pickaxe"])) {
+    if (has(["stone_sword","iron_sword","diamond_sword","netherite_sword"])) return true;
+  }
+
+  const stone = nearestBlock(["stone","cobblestone"], 48);
+  if (stone && !(await mineBlock(stone))) return false;
+
+  await collectBlocks(["stone","cobblestone"], 11);
+  await craft("stone_pickaxe", 1);
+  await craft("stone_sword", 1);
+  await craft("stone_axe", 1);
+
+  return has(["stone_pickaxe","iron_pickaxe","diamond_pickaxe","netherite_pickaxe"]);
+}
+
+async function getFoodFast() {
+  if (bot.food >= CFG.lowFood) return true;
+
+  const animal = nearestEntity(e =>
+    ["cow","pig","sheep","chicken"].includes(e.name) &&
+    distance(bot.entity.position, e.position) <= 18
+  );
+
+  if (animal) {
+    await fight(animal);
+    await sleep(150);
+  }
+
+  return eat();
+}
+
+async function fight(target) {
+  if (!target || !target.isValid) return;
+  if (distance(bot.entity.position, target.position) > CFG.hostileRange) return;
+
+  if (bot.health <= CFG.lowHealth) {
+    await escapeDanger();
+    await eat();
+    return;
+  }
+
+  if (dangerAt(target.position)) return;
+
+  await equipBest(WEAPONS);
+
+  try {
+    bot.pvp.attack(target);
+
+    const deadline = Date.now() + 4500;
+
+    while (target.isValid && Date.now() < deadline) {
+      if (bot.health <= CFG.lowHealth || dangerAt(bot.entity.position)) {
+        bot.pvp.stop();
+        await escapeDanger();
+        await eat();
+        break;
       }
+
+      await sleep(120);
     }
-    runOnePhase()
-    return
+
+    bot.pvp.stop();
+  } catch {
+    bot.pvp.stop();
   }
-  if (upper === 'STOP') {
-    stopBot('terminal command')
-    return
+}
+
+async function handleCombat() {
+  const target = nearestEntity(e =>
+    isHostile(e) &&
+    distance(bot.entity.position, e.position) <= CFG.hostileRange
+  );
+
+  if (target) {
+    log("Fighting", target.name);
+    await fight(target);
   }
-  if (upper === 'STATUS') {
-    printStatus()
-    return
+}
+
+async function getCoalAndSurface() {
+  const coal = nearestBlock(["coal_ore","deepslate_coal_ore"], 48);
+
+  if (coal) {
+    await mineBlock(coal);
+    await collectBlocks(["coal_ore","deepslate_coal_ore"], 4);
   }
-  if (upper === 'CORDS' || upper === 'COORDS') {
-    say(`CORDS -> ${pos() || 'unknown'}`)
-    return
-  }
-  if (upper === 'CHAT') {
-    say('Usage: CHAT your message')
-    return
-  }
-  if (upper.startsWith('CHAT ')) {
-    const msg = input.slice(5).trim()
-    if (msg) bot.chat(msg)
-    return
-  }
-  if (upper === 'PAUSE') {
-    bot.pathfinder.setGoal(null)
-    bot.pvp.stop()
-    say(`Paused at ${pos() || 'unknown'}.`)
-    return
-  }
-  if (upper === 'TASK') {
-    say(`CURRENT TASK -> phase=${phase} action=${lastAction || 'idle'} pos=${pos() || 'unknown'}`)
-    return
-  }
-  if (upper === 'INV') {
-    const items = bot.inventory.items()
-    if (!items.length) {
-      say('Inventory is empty.')
-      return
+
+  // Prefer returning upward rather than continuing deep underground.
+  const startY = bot.entity.position.y;
+  if (startY < 70) {
+    for (let i = 0; i < 10 && bot.entity.position.y < 70; i++) {
+      const p = bot.entity.position;
+      const goal = new goals.GoalNear(p.x, Math.min(100, p.y + 8), p.z, 2);
+      if (!(await safeGoto(goal, 5000))) break;
     }
-    const grouped = {}
-    for (const it of items) grouped[it.name] = (grouped[it.name] || 0) + it.count
-    say('Inventory:')
-    for (const [name, count] of Object.entries(grouped)) say(`  ${name} x${count}`)
-    return
   }
-  if (upper === 'HELP') {
-    say('RUN | STOP | PAUSE | STATUS | CORDS | TASK | INV | CHAT <message>')
-    return
+}
+
+async function safeExplore() {
+  const p = bot.entity.position.floored();
+
+  // Short, efficient routes. No random spinning or head snapping.
+  const choices = [
+    p.offset(20,0,0),
+    p.offset(-20,0,0),
+    p.offset(0,0,20),
+    p.offset(0,0,-20)
+  ];
+
+  for (const t of choices) {
+    if (await safeGoto(new goals.GoalNear(t.x,t.y,t.z,3), 7000)) return;
   }
-  if (input) say('Unknown command. Type HELP.')
-})
+}
+
+async function recoverAfterDeath() {
+  if (!recovering) return;
+  recovering = false;
+
+  await sleep(1800);
+
+  // Never attempt recovery if the death location is obviously dangerous.
+  if (!deathPosition || dangerAt(deathPosition)) {
+    setTask("Restarting progression after unsafe death");
+    log("Death area unsafe; restarting progression.");
+    phase = "WOOD";
+    return;
+  }
+
+  // Only walk a short distance toward the death location.
+  const d = distance(bot.entity.position, deathPosition);
+
+  if (d > 24) {
+    log("Death drops too far away; restarting progression.");
+    phase = "WOOD";
+    return;
+  }
+
+  log("Attempting safe death-drop recovery.");
+
+  const ok = await safeGoto(
+    new goals.GoalNear(
+      deathPosition.x,
+      deathPosition.y,
+      deathPosition.z,
+      2
+    ),
+    9000
+  );
+
+  if (!ok || dangerAt(bot.entity.position)) {
+    log("Recovery unsafe; restarting from zero.");
+    phase = "WOOD";
+    return;
+  }
+
+  await sleep(1200);
+  await equipBest(PICKAXES);
+  phase = has(PICKAXES) ? "FOOD" : "WOOD";
+}
+
+async function progressionStep() {
+  if (phase === "WOOD") {
+    setTask("Getting wood and starter tools");
+    log("Wood + starter tools");
+    await getWoodAndStarterTools();
+    phase = "STONE";
+    return;
+  }
+
+  if (phase === "STONE") {
+    setTask("Getting stone tools");
+    log("Stone tools");
+    await getStoneTools();
+    phase = "FOOD";
+    return;
+  }
+
+  if (phase === "FOOD") {
+    setTask("Getting food");
+    log("Food");
+    await getFoodFast();
+    phase = "COAL";
+    return;
+  }
+
+  if (phase === "COAL") {
+    setTask("Getting coal and resurfacing");
+    log("Coal + resurface");
+    await getCoalAndSurface();
+    phase = "SURVIVE";
+    return;
+  }
+
+  if (phase === "SURVIVE") {
+    setTask("Surviving and exploring safely");
+    await equipBest(PICKAXES);
+    await eat();
+    await safeExplore();
+  }
+}
+
+function createBot() {
+  bot = mineflayer.createBot({
+    host: CFG.host,
+    port: CFG.port,
+    username: CFG.username,
+    version: CFG.version
+  });
+
+  bot.loadPlugin(pathfinder);
+  bot.loadPlugin(pvp);
+
+  bot.once("spawn", async () => {
+    data = minecraftData(bot.version);
+    moves = new Movements(bot, data);
+    enableFastMovement();
+
+    phase = "WOOD";
+    setTask("Starting survival progression");
+    log(`Connected to ${CFG.host}:${CFG.port} as ${CFG.username}`);
+    log("Fast movement enabled; no head/camera snapping.");
+  });
+
+  bot.on("death", () => {
+    deathPosition = bot.entity.position.clone();
+    deathTime = Date.now();
+    recovering = true;
+    phase = "RECOVER";
+    bot.pvp.stop();
+    setTask("Recovering after death");
+    log("Died. Checking for safe recovery after respawn.");
+  });
+
+  bot.on("chat", (username, message) => {
+    if (username === bot.username) return;
+
+    // The incoming Mineflayer chat event gives the actual Minecraft username.
+    // We only use that value for display; we do not spoof or rewrite senders.
+    const sender = playerNameForChat(username);
+    log(`<${sender}> ${message}`);
+
+    if (message === "!task") {
+      sendChat(`Task: ${currentTask} | Phase: ${phase}`);
+      return;
+    }
+
+    if (message === "!inv") {
+      sendChat(`Inventory: ${inventorySummary()}`);
+      return;
+    }
+
+    if (message === "!status") {
+      sendChat(
+        `Status: task=${currentTask} | phase=${phase} | hp=${Math.round(bot.health)} | food=${Math.round(bot.food)}`
+      );
+      return;
+    }
+
+    if (message === "!stop") {
+      stopped = true;
+      setTask("Stopped by command");
+      bot.pathfinder.setGoal(null);
+      bot.pvp.stop();
+      bot.clearControlStates();
+      sendChat("Stopped.");
+      return;
+    }
+
+    if (message === "!resume") {
+      stopped = false;
+      enableFastMovement();
+      setTask("Resuming survival tasks");
+      sendChat("Resuming.");
+    }
+  });
+
+  bot.on("health", () => {
+    if (bot.health <= CFG.lowHealth) {
+      bot.pvp.stop();
+      bot.setControlState("sprint", true);
+    }
+  });
+
+  bot.on("kicked", reason => log("Kicked:", reason));
+  bot.on("error", err => log("Network/error:", err.message));
+  bot.on("end", () => {
+    log(`Disconnected; reconnecting in ${CFG.reconnectMs}ms`);
+    setTimeout(createBot, CFG.reconnectMs);
+  });
+
+  runLoop();
+}
+
+async function runLoop() {
+  while (bot) {
+    await sleep(CFG.loopMs);
+
+    if (!bot.entity || !data || stopped) continue;
+
+    if (recovering) {
+      await recoverAfterDeath();
+      continue;
+    }
+
+    // Highest-priority safety checks.
+    if (dangerAt(bot.entity.position)) {
+      await escapeDanger();
+      continue;
+    }
+
+    if (bot.food < CFG.lowFood) await eat();
+
+    await handleCombat();
+
+    if (bot.health <= CFG.lowHealth) {
+      await escapeDanger();
+      await eat();
+      continue;
+    }
+
+    await progressionStep();
+  }
+}
+
+createBot();
