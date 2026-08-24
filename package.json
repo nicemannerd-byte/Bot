@@ -7,7 +7,7 @@
     "node": ">=18"
   },
   "scripts": {
-    "start": "node bot.js"
+    "start": "node movement-fix.js"
   },
   "dependencies": {
     "mineflayer": "^4.37.1",
