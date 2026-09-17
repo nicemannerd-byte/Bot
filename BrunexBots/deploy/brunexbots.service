@@ -1,0 +1,16 @@
+[Unit]
+Description=BrunexBots private-server controller
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/brunexbots
+ExecStart=/usr/bin/node /opt/brunexbots/slither-bots.js
+Restart=always
+RestartSec=5
+Environment=MAX_BOTS=100
+Environment=NODE_ENV=production
+
+[Install]
+WantedBy=multi-user.target
